@@ -1,0 +1,10 @@
+[package]
+name = "reader"
+version = "0.1.0"
+edition = "2021"
+description = "PCD file reader for point cloud data"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+lzf-sys = "0.1"

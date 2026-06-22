@@ -1,0 +1,13 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight, CLI-based point cloud viewer for .pcd files"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+reader = {  path = "../reader" }
+render = {  path = "../render" }
+miniquad = "0.4.11"
