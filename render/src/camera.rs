@@ -94,6 +94,43 @@ impl Camera {
         self.center += (right * dx + up * dy) * pan_speed;
     }
 
+    /// Zoom by a pinch scale factor (two-finger pinch on touch screens).
+    /// `factor` > 1.0 zooms in, < 1.0 zooms out.
+    /// The raw pixel ratio is damped to avoid the cloud disappearing on small
+    /// accidental movements (lerp 15% toward the raw ratio per frame).
+    pub fn zoom_pinch(&mut self, factor: f32) {
+        // Damp: blend 15% of the raw delta per event so large jumps are smoothed.
+        let damped = 1.0 + (factor - 1.0) * 0.15;
+        // Hard clamp so a single event never changes distance by more than 10%.
+        let clamped = damped.clamp(0.90, 1.10);
+        self.distance /= clamped;
+        self.distance = self.distance.max(0.1);
+    }
+
+    /// Fly the camera forward/backward along its look direction.
+    /// Positive `delta` moves into the cloud (toward where the camera is pointing).
+    /// Speed scales with current distance so it feels natural at any zoom level.
+    pub fn fly_forward(&mut self, delta: f32) {
+        let speed = self.distance * 0.008;
+        let cos_pitch = self.pitch.cos();
+        // Forward vector: direction from camera toward center.
+        let forward = Vector3::new(
+            -cos_pitch * self.yaw.sin(),
+            -self.pitch.sin(),
+            -cos_pitch * self.yaw.cos(),
+        );
+        self.center += forward * delta * speed;
+    }
+
+    /// Strafe the camera left/right (perpendicular to look direction, on the XZ plane).
+    /// Positive `delta` moves right.
+    pub fn strafe(&mut self, delta: f32) {
+        let speed = self.distance * 0.008;
+        // Right vector is perpendicular to forward on the XZ plane.
+        let right = Vector3::new(-self.yaw.sin(), 0.0, self.yaw.cos());
+        self.center += right * delta * speed;
+    }
+
     /// Pan the camera center (mouse-style, fixed sensitivity).
     /// `dx` and `dy` are raw pixel deltas from mouse motion.
     /// Note: screen Y is inverted (down = positive), so we negate dy.

@@ -6,16 +6,27 @@
 //! Uses nalgebra for raycasting in point selection.
 
 use nalgebra::{Matrix4, Vector3, Vector4};
+use std::collections::HashMap;
+
 use miniquad::{
     conf, window, BufferId, BufferLayout, BufferSource, BufferType, BufferUsage, EventHandler,
     GlContext, KeyCode, KeyMods, Pipeline, PipelineParams, PrimitiveType, RenderingBackend,
-    ShaderMeta, ShaderSource, UniformBlockLayout, UniformDesc, UniformType, VertexAttribute,
-    VertexFormat,
+    ShaderMeta, ShaderSource, TouchPhase, UniformBlockLayout, UniformDesc, UniformType,
+    VertexAttribute, VertexFormat,
 };
 use miniquad::graphics::raw_gl::{glEnable, GL_PROGRAM_POINT_SIZE};
 
 use crate::camera::Camera;
 use reader::PointCloud;
+
+/// Navigation mode for touch / tablet input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavMode {
+    /// Orbit around a fixed center point (default).
+    Orbit,
+    /// Fly through the cloud: 1-finger look, 2-finger move.
+    Fly,
+}
 
 /// Default point render color (light gray).
 const DEFAULT_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
@@ -81,6 +92,10 @@ pub struct Viewer {
     axis_index_buffer: Option<BufferId>,
     /// Axis frame line pipeline.
     axis_pipeline: Option<Pipeline>,
+    /// Active touch points: id → (x, y). Supports 1-finger orbit and 2-finger pinch/pan.
+    touch_points: HashMap<u64, (f32, f32)>,
+    /// Current touch/tablet navigation mode.
+    nav_mode: NavMode,
 }
 
 impl Viewer {
@@ -107,6 +122,8 @@ impl Viewer {
             axis_vertex_buffer: None,
             axis_index_buffer: None,
             axis_pipeline: None,
+            touch_points: HashMap::new(),
+            nav_mode: NavMode::Orbit,
         }
     }
 
@@ -500,6 +517,18 @@ impl EventHandler for Viewer {
                 println!("Point size: {:.1}", self.point_size);
                 self.rebuild_vertex_buffer();
             }
+            KeyCode::F => {
+                self.nav_mode = match self.nav_mode {
+                    NavMode::Orbit => {
+                        println!("[pcdviewr] Nav mode: Fly  (1-finger/drag=look, 2-finger=move, F=back to Orbit)");
+                        NavMode::Fly
+                    }
+                    NavMode::Fly => {
+                        println!("[pcdviewr] Nav mode: Orbit  (drag=orbit, pinch=zoom, F=Fly)");
+                        NavMode::Orbit
+                    }
+                };
+            }
             _ => {}
         }
     }
@@ -512,6 +541,112 @@ impl EventHandler for Viewer {
             _ => {}
         }
     }
+
+    /// Touch/tablet gesture handler.
+    ///
+    /// **Orbit mode** (default):
+    ///   - 1 finger drag       → orbit around center
+    ///   - 2 finger pinch      → zoom (damped)
+    ///   - 2 finger drag       → pan center
+    ///   - 3 finger tap        → switch to Fly mode
+    ///
+    /// **Fly mode** (press `F` or 3-finger tap to enter):
+    ///   - 1 finger drag       → look around (yaw / pitch in place)
+    ///   - 2 finger drag up    → fly forward into cloud
+    ///   - 2 finger drag down  → fly backward
+    ///   - 2 finger drag left  → strafe left
+    ///   - 2 finger drag right → strafe right
+    ///   - 3 finger tap        → switch back to Orbit mode
+    fn touch_event(&mut self, phase: TouchPhase, id: u64, x: f32, y: f32) {
+        match phase {
+            TouchPhase::Started => {
+                self.touch_points.insert(id, (x, y));
+                // 3-finger tap toggles navigation mode
+                if self.touch_points.len() == 3 {
+                    self.nav_mode = match self.nav_mode {
+                        NavMode::Orbit => {
+                            println!("[pcdviewr] Nav mode: Fly  (1-finger=look, 2-finger=move, 3-finger=back to Orbit)");
+                            NavMode::Fly
+                        }
+                        NavMode::Fly => {
+                            println!("[pcdviewr] Nav mode: Orbit  (1-finger=orbit, 2-finger=pinch/pan, 3-finger=Fly)");
+                            NavMode::Orbit
+                        }
+                    };
+                }
+            }
+            TouchPhase::Moved => {
+                // Snapshot old positions before updating
+                let old = self.touch_points.clone();
+                self.touch_points.insert(id, (x, y));
+
+                let count = self.touch_points.len();
+
+                match self.nav_mode {
+                    NavMode::Orbit => {
+                        if count == 1 {
+                            if let Some(&(old_x, old_y)) = old.get(&id) {
+                                self.camera.orbit(x - old_x, y - old_y);
+                            }
+                        } else if count == 2 {
+                            let ids: Vec<u64> = self.touch_points.keys().copied().collect();
+                            let (id_a, id_b) = (ids[0], ids[1]);
+
+                            let (ax, ay) = self.touch_points[&id_a];
+                            let (bx, by) = self.touch_points[&id_b];
+                            let (old_ax, old_ay) = old.get(&id_a).copied().unwrap_or((ax, ay));
+                            let (old_bx, old_by) = old.get(&id_b).copied().unwrap_or((bx, by));
+
+                            // Damped pinch zoom
+                            let old_dist = ((old_ax - old_bx).powi(2) + (old_ay - old_by).powi(2)).sqrt();
+                            let new_dist = ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt();
+                            if old_dist > 1.0 {
+                                self.camera.zoom_pinch(new_dist / old_dist);
+                            }
+
+                            // Pan via midpoint delta
+                            let dmx = (ax + bx) / 2.0 - (old_ax + old_bx) / 2.0;
+                            let dmy = (ay + by) / 2.0 - (old_ay + old_by) / 2.0;
+                            if dmx.abs() > 0.5 || dmy.abs() > 0.5 {
+                                self.camera.pan_mouse(dmx, dmy);
+                            }
+                        }
+                    }
+                    NavMode::Fly => {
+                        if count == 1 {
+                            // Look around: just change yaw/pitch without moving the center
+                            if let Some(&(old_x, old_y)) = old.get(&id) {
+                                self.camera.orbit(x - old_x, y - old_y);
+                            }
+                        } else if count == 2 {
+                            // Use midpoint delta for fly movement
+                            let ids: Vec<u64> = self.touch_points.keys().copied().collect();
+                            let (id_a, id_b) = (ids[0], ids[1]);
+
+                            let (ax, ay) = self.touch_points[&id_a];
+                            let (bx, by) = self.touch_points[&id_b];
+                            let (old_ax, old_ay) = old.get(&id_a).copied().unwrap_or((ax, ay));
+                            let (old_bx, old_by) = old.get(&id_b).copied().unwrap_or((bx, by));
+
+                            let dmx = (ax + bx) / 2.0 - (old_ax + old_bx) / 2.0;
+                            let dmy = (ay + by) / 2.0 - (old_ay + old_by) / 2.0;
+
+                            // Vertical midpoint delta → fly forward/back (screen Y down = forward)
+                            if dmy.abs() >= dmx.abs() {
+                                self.camera.fly_forward(dmy);
+                            } else {
+                                // Horizontal midpoint delta → strafe
+                                self.camera.strafe(dmx);
+                            }
+                        }
+                    }
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.touch_points.remove(&id);
+            }
+        }
+    }
 }
 
 /// Run the viewer with the given point cloud.
@@ -521,7 +656,7 @@ pub fn run(cloud: PointCloud, show_origin: bool) {
     if show_origin {
         println!("Origin axis frame: enabled (X=red, Y=green, Z=blue)");
     }
-    println!("Controls: Q/Escape = quit | Ctrl+Click = select point | +/- = point size | Drag = orbit | Scroll = zoom");
+    println!("Controls: Q/Escape=quit | Ctrl+Click=select | +/-=point size | Drag=orbit | Scroll=zoom | F=toggle Fly mode");
     let viewer = Viewer::new(cloud, show_origin);
 
     miniquad::start(
