@@ -8,9 +8,10 @@
 use nalgebra::{Matrix4, Vector3, Vector4};
 use std::collections::HashMap;
 
+use egui_miniquad::EguiMq;
 use miniquad::{
     conf, window, BufferId, BufferLayout, BufferSource, BufferType, BufferUsage, EventHandler,
-    GlContext, KeyCode, KeyMods, Pipeline, PipelineParams, PrimitiveType, RenderingBackend,
+    KeyCode, KeyMods, Pipeline, PipelineParams, PrimitiveType, RenderingBackend,
     ShaderMeta, ShaderSource, TouchPhase, UniformBlockLayout, UniformDesc, UniformType,
     VertexAttribute, VertexFormat,
 };
@@ -70,7 +71,7 @@ void main() {
 pub struct Viewer {
     cloud: PointCloud,
     camera: Camera,
-    ctx: Option<GlContext>,
+    ctx: Option<Box<dyn RenderingBackend>>,
     pipeline: Option<Pipeline>,
     vertex_buffer: Option<BufferId>,
     index_buffer: Option<BufferId>,
@@ -96,6 +97,8 @@ pub struct Viewer {
     touch_points: HashMap<u64, (f32, f32)>,
     /// Current touch/tablet navigation mode.
     nav_mode: NavMode,
+    /// egui context + renderer (created lazily after the window is live).
+    egui_mq: Option<EguiMq>,
 }
 
 impl Viewer {
@@ -124,6 +127,7 @@ impl Viewer {
             axis_pipeline: None,
             touch_points: HashMap::new(),
             nav_mode: NavMode::Orbit,
+            egui_mq: None,
         }
     }
 
@@ -134,9 +138,13 @@ impl Viewer {
         // Compute bounds for axis scaling
         let (bounds_min, bounds_max) = cloud_bounds(&self.cloud);
 
-        // Create GL context here (inside miniquad event loop, where GL is valid)
-        self.ctx = Some(GlContext::new());
-        let ctx = self.ctx.as_mut().unwrap();
+        // Create a single rendering backend shared by both our 3D rendering
+        // and egui. Two separate backends pointing at the same GL context
+        // corrupt each other's state tracking and cause uniform layout panics.
+        let mut mq_ctx = window::new_rendering_backend();
+        self.egui_mq = Some(EguiMq::new(&mut *mq_ctx));
+        self.ctx = Some(mq_ctx);
+        let ctx = self.ctx.as_mut().unwrap().as_mut();
 
         // Enable GL_PROGRAM_POINT_SIZE so vertex shader can control gl_PointSize
         unsafe {
@@ -452,6 +460,77 @@ impl EventHandler for Viewer {
 
         // End render pass
         self.ctx.as_mut().unwrap().end_render_pass();
+
+        // ── egui HUD overlay ─────────────────────────────────────────────────
+        // We move egui_mq out of self so we can freely borrow `self` inside
+        // the closure (e.g. to call rebuild_vertex_buffer).
+        let mut egui_opt = self.egui_mq.take();
+        if let Some(egui_mq) = egui_opt.as_mut() {
+            let nav_mode   = self.nav_mode;
+            let point_size = self.point_size;
+            let mut new_nav_mode   = nav_mode;
+            let mut new_point_size = point_size;
+
+            egui_mq.run(self.ctx.as_mut().unwrap().as_mut(), |_ctx, egui_ctx| {
+                egui_ctx.set_style({
+                    let mut style = (*egui_ctx.style()).clone();
+                    style.text_styles.insert(
+                        egui::TextStyle::Button,
+                        egui::FontId::proportional(22.0),
+                    );
+                    style.spacing.button_padding = egui::vec2(16.0, 10.0);
+                    style.spacing.item_spacing   = egui::vec2(8.0, 6.0);
+                    style
+                });
+
+                let (w, _h) = window::screen_size();
+                egui::Window::new("hud")
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
+                    .fixed_size(egui::vec2(w.min(500.0), 60.0))
+                    .show(egui_ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            let mode_label = match nav_mode {
+                                NavMode::Orbit => "✈ Fly Mode",
+                                NavMode::Fly   => "🔄 Orbit Mode",
+                            };
+                            if ui.button(mode_label).clicked() {
+                                new_nav_mode = match nav_mode {
+                                    NavMode::Orbit => NavMode::Fly,
+                                    NavMode::Fly   => NavMode::Orbit,
+                                };
+                            }
+                            ui.separator();
+                            ui.label("Points:");
+                            if ui.button("＋").clicked() {
+                                new_point_size = (point_size * 1.25).min(5.0);
+                            }
+                            ui.label(format!("{:.1}", point_size));
+                            if ui.button("－").clicked() {
+                                new_point_size = (point_size / 1.25).max(1.0);
+                            }
+                        });
+                    });
+            });
+
+            egui_mq.draw(self.ctx.as_mut().unwrap().as_mut());
+
+            // Apply HUD changes now that egui_mq is no longer borrowing self
+            if new_nav_mode != nav_mode {
+                self.nav_mode = new_nav_mode;
+                println!("[pcdviewr] Nav mode: {:?}", self.nav_mode);
+            }
+            if (new_point_size - point_size).abs() > 0.001 {
+                self.point_size = new_point_size;
+                println!("Point size: {:.1}", self.point_size);
+                self.rebuild_vertex_buffer();
+            }
+        }
+        self.egui_mq = egui_opt; // put it back
+
+        self.ctx.as_mut().unwrap().commit_frame();
     }
 
     fn mouse_button_down_event(
@@ -460,6 +539,14 @@ impl EventHandler for Viewer {
         x: f32,
         y: f32,
     ) {
+        // Forward to egui first
+        if let Some(e) = self.egui_mq.as_mut() { e.mouse_button_down_event(button, x, y); }
+
+        // Block 3D interaction when egui is handling the pointer
+        if self.egui_mq.as_ref().map(|e| e.egui_ctx().is_pointer_over_area()).unwrap_or(false) {
+            return;
+        }
+
         // Ctrl+click: pick nearest point
         if self.ctrl_held && button == miniquad::MouseButton::Left {
             if let Some(idx) = self.pick_point(x, y) {
@@ -476,14 +563,21 @@ impl EventHandler for Viewer {
 
     fn mouse_button_up_event(
         &mut self,
-        _button: miniquad::MouseButton,
-        _x: f32,
-        _y: f32,
+        button: miniquad::MouseButton,
+        x: f32,
+        y: f32,
     ) {
+        if let Some(e) = self.egui_mq.as_mut() { e.mouse_button_up_event(button, x, y); }
         self.mouse_down = false;
     }
 
     fn mouse_motion_event(&mut self, x: f32, y: f32) {
+        if let Some(e) = self.egui_mq.as_mut() { e.mouse_motion_event(x, y); }
+
+        if self.egui_mq.as_ref().map(|e| e.egui_ctx().is_pointer_over_area()).unwrap_or(false) {
+            return;
+        }
+
         if self.mouse_down {
             let dx = x - self.last_mouse.0;
             let dy = y - self.last_mouse.1;
@@ -496,7 +590,8 @@ impl EventHandler for Viewer {
         self.camera.zoom(y);
     }
 
-    fn key_down_event(&mut self, key: KeyCode, _mods: KeyMods, _repeat: bool) {
+    fn key_down_event(&mut self, key: KeyCode, mods: KeyMods, _repeat: bool) {
+        if let Some(e) = self.egui_mq.as_mut() { e.key_down_event(key, mods); }
         match key {
             KeyCode::Q => {
                 window::quit();
@@ -540,6 +635,10 @@ impl EventHandler for Viewer {
             }
             _ => {}
         }
+    }
+
+    fn char_event(&mut self, character: char, _mods: KeyMods, _repeat: bool) {
+        if let Some(e) = self.egui_mq.as_mut() { e.char_event(character); }
     }
 
     /// Touch/tablet gesture handler.

@@ -11,3 +11,4 @@ clap = { version = "4", features = ["derive"] }
 reader = {  path = "../reader" }
 render = {  path = "../render" }
 miniquad = "0.4.11"
+egui = "0.31"

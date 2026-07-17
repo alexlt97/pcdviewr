@@ -10,3 +10,5 @@ thiserror = "2"
 miniquad = "0.4"
 nalgebra = { version = "0.33", features = ["std"] }
 reader = {  path = "../reader" }
+egui-miniquad = "0.16"
+egui = "0.31"
