@@ -81,6 +81,8 @@ pub struct Viewer {
     last_mouse: (f32, f32),
     /// Index of the currently selected point (via Ctrl+click).
     selected_point: Option<usize>,
+    /// Cached info about selected point for display: (index, x, y, z).
+    selected_point_info: Option<(usize, f32, f32, f32)>,
     /// Whether the Ctrl key is currently held.
     ctrl_held: bool,
     /// Render size of regular points (adjustable with +/- keys).
@@ -97,6 +99,10 @@ pub struct Viewer {
     touch_points: HashMap<u64, (f32, f32)>,
     /// Current touch/tablet navigation mode.
     nav_mode: NavMode,
+    /// Which mouse button is currently held down
+    mouse_button_down: Option<miniquad::MouseButton>,
+    /// Whether shift key is held
+    shift_held: bool,
     /// egui context + renderer (created lazily after the window is live).
     egui_mq: Option<EguiMq>,
 }
@@ -119,6 +125,7 @@ impl Viewer {
             mouse_down: false,
             last_mouse: (0.0, 0.0),
             selected_point: None,
+            selected_point_info: None,
             ctrl_held: false,
             point_size: 1.0,
             show_origin,
@@ -127,6 +134,8 @@ impl Viewer {
             axis_pipeline: None,
             touch_points: HashMap::new(),
             nav_mode: NavMode::Orbit,
+            mouse_button_down: None,
+            shift_held: false,
             egui_mq: None,
         }
     }
@@ -215,8 +224,8 @@ impl Viewer {
         if self.show_origin {
             // Axis length scales with cloud bounds
             let scale = (bounds_max[0] - bounds_min[0])
-                .max((bounds_max[1] - bounds_min[1]))
-                .max((bounds_max[2] - bounds_min[2]))
+                .max(bounds_max[1] - bounds_min[1])
+                .max(bounds_max[2] - bounds_min[2])
                 * 0.1;
 
             // 6 vertices: X axis (red), Y axis (green), Z axis (blue)
@@ -404,7 +413,7 @@ impl Viewer {
 
 impl EventHandler for Viewer {
     fn update(&mut self) {
-        // Initialization happens in draw() to ensure context is ready
+        // No per-frame updates needed - all navigation is event-driven (mouse/scroll)
     }
 
     fn draw(&mut self) {
@@ -470,48 +479,99 @@ impl EventHandler for Viewer {
             let point_size = self.point_size;
             let mut new_nav_mode   = nav_mode;
             let mut new_point_size = point_size;
+            
+            // Pre-calculate cloud bounds for display
+            let (cloud_min, cloud_max) = cloud_bounds(&self.cloud);
+            let extent_x = cloud_max[0] - cloud_min[0];
+            let extent_y = cloud_max[1] - cloud_min[1];
+            let extent_z = cloud_max[2] - cloud_min[2];
+            let camera_dist = self.camera.distance;
 
             egui_mq.run(self.ctx.as_mut().unwrap().as_mut(), |_ctx, egui_ctx| {
                 egui_ctx.set_style({
                     let mut style = (*egui_ctx.style()).clone();
                     style.text_styles.insert(
                         egui::TextStyle::Button,
-                        egui::FontId::proportional(22.0),
+                        egui::FontId::proportional(14.0),  // Reduced from 22
                     );
-                    style.spacing.button_padding = egui::vec2(16.0, 10.0);
-                    style.spacing.item_spacing   = egui::vec2(8.0, 6.0);
+                    style.text_styles.insert(
+                        egui::TextStyle::Body,
+                        egui::FontId::proportional(12.0),  // Smaller body text
+                    );
+                    style.spacing.button_padding = egui::vec2(8.0, 4.0);  // Reduced from 16, 10
+                    style.spacing.item_spacing   = egui::vec2(4.0, 2.0);  // Reduced from 8, 6
                     style
                 });
 
-                let (w, _h) = window::screen_size();
+                let (_w, _h) = window::screen_size();
+                let selected_info = self.selected_point_info;
+                
+                // ─── TOP-LEFT: Point Cloud Measurements ───
+                egui::Window::new("measurements")
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+                    .show(egui_ctx, |ui| {
+                        ui.style_mut().text_styles.insert(
+                            egui::TextStyle::Body,
+                            egui::FontId::monospace(11.0),
+                        );
+                        ui.label(format!("Points: {}", self.cloud.len()));
+                        ui.label(format!("X: {:.2} to {:.2} (Δ{:.2})", cloud_min[0], cloud_max[0], extent_x));
+                        ui.label(format!("Y: {:.2} to {:.2} (Δ{:.2})", cloud_min[1], cloud_max[1], extent_y));
+                        ui.label(format!("Z: {:.2} to {:.2} (Δ{:.2})", cloud_min[2], cloud_max[2], extent_z));
+                        ui.separator();
+                        ui.label(format!("Camera dist: {:.1}", camera_dist));
+                        ui.separator();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(100, 200, 255),
+                            "CloudCompare Controls:"
+                        );
+                        ui.label("L-drag = Rotate");
+                        ui.label("M-drag = Pan");
+                        ui.label("Shift+L = Pan");
+                        ui.label("R-drag = Zoom");
+                        ui.label("Scroll = Zoom");
+                        
+                        // Show selected point info if available
+                        if let Some((idx, x, y, z)) = selected_info {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 100, 100),
+                                format!("Point [{}]:", idx)
+                            );
+                            ui.label(format!("  x: {:.4}", x));
+                            ui.label(format!("  y: {:.4}", y));
+                            ui.label(format!("  z: {:.4}", z));
+                        }
+                    });
+
+                // ─── BOTTOM-CENTER: Point Size Control HUD ───
                 egui::Window::new("hud")
                     .title_bar(false)
                     .resizable(false)
                     .collapsible(false)
-                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
-                    .fixed_size(egui::vec2(w.min(500.0), 60.0))
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -8.0))
+                    .fixed_size(egui::vec2(400.0, if selected_info.is_some() { 80.0 } else { 40.0 }))
                     .show(egui_ctx, |ui| {
                         ui.horizontal(|ui| {
-                            let mode_label = match nav_mode {
-                                NavMode::Orbit => "✈ Fly Mode",
-                                NavMode::Fly   => "🔄 Orbit Mode",
-                            };
-                            if ui.button(mode_label).clicked() {
-                                new_nav_mode = match nav_mode {
-                                    NavMode::Orbit => NavMode::Fly,
-                                    NavMode::Fly   => NavMode::Orbit,
-                                };
-                            }
-                            ui.separator();
-                            ui.label("Points:");
-                            if ui.button("＋").clicked() {
+                            ui.label("Point Size:");
+                            if ui.button("+").clicked() {
                                 new_point_size = (point_size * 1.25).min(5.0);
                             }
                             ui.label(format!("{:.1}", point_size));
-                            if ui.button("－").clicked() {
+                            if ui.button("-").clicked() {
                                 new_point_size = (point_size / 1.25).max(1.0);
                             }
                         });
+                        
+                        if let Some((idx, x, y, z)) = selected_info {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Point [{}]: x={:.4}, y={:.4}, z={:.4}", idx, x, y, z));
+                            });
+                        }
                     });
             });
 
@@ -552,11 +612,18 @@ impl EventHandler for Viewer {
             if let Some(idx) = self.pick_point(x, y) {
                 self.selected_point = Some(idx);
                 let p = &self.cloud.points()[idx];
-                println!("Selected point {}: ({:.4}, {:.4}, {:.4})", idx, p.x(), p.y(), p.z());
+                let px = p.x();
+                let py = p.y();
+                let pz = p.z();
+                self.selected_point_info = Some((idx, px, py, pz));
+                println!("Selected point {}: ({:.4}, {:.4}, {:.4})", idx, px, py, pz);
             }
             return;
         }
 
+        // CloudCompare navigation:
+        // Left drag = Rotate, Middle drag OR Shift+Left = Pan, Right drag = Zoom
+        self.mouse_button_down = Some(button);
         self.mouse_down = true;
         self.last_mouse = (x, y);
     }
@@ -568,6 +635,7 @@ impl EventHandler for Viewer {
         y: f32,
     ) {
         if let Some(e) = self.egui_mq.as_mut() { e.mouse_button_up_event(button, x, y); }
+        self.mouse_button_down = None;
         self.mouse_down = false;
     }
 
@@ -581,7 +649,31 @@ impl EventHandler for Viewer {
         if self.mouse_down {
             let dx = x - self.last_mouse.0;
             let dy = y - self.last_mouse.1;
-            self.camera.orbit(dx, dy);
+            
+            // CloudCompare navigation model:
+            // Left drag = Rotate around center (orbit)
+            // Middle drag OR Shift+Left = Pan
+            // Right drag = Zoom
+            match self.mouse_button_down {
+                Some(miniquad::MouseButton::Left) => {
+                    if self.shift_held {
+                        // Shift+Left drag = Pan
+                        self.camera.pan_mouse(dx, dy);
+                    } else {
+                        // Left drag = Orbit
+                        self.camera.orbit(dx, dy);
+                    }
+                }
+                Some(miniquad::MouseButton::Middle) => {
+                    // Middle drag = Pan
+                    self.camera.pan_mouse(dx, dy);
+                }
+                Some(miniquad::MouseButton::Right) => {
+                    // Right drag = Zoom (vertical movement = zoom direction)
+                    self.camera.zoom(dy * 0.1);
+                }
+                _ => {}
+            }
             self.last_mouse = (x, y);
         }
     }
@@ -592,46 +684,42 @@ impl EventHandler for Viewer {
 
     fn key_down_event(&mut self, key: KeyCode, mods: KeyMods, _repeat: bool) {
         if let Some(e) = self.egui_mq.as_mut() { e.key_down_event(key, mods); }
+        
+        // Track Shift key for pan mode
+        if mods.shift {
+            self.shift_held = true;
+        }
+        
+        // Handle keys
         match key {
-            KeyCode::Q => {
-                window::quit();
-            }
             KeyCode::Escape => {
                 window::quit();
             }
             KeyCode::LeftControl | KeyCode::RightControl => {
                 self.ctrl_held = true;
             }
-            KeyCode::Equal => {
+            KeyCode::Equal | KeyCode::KpAdd => {
                 self.point_size = (self.point_size * 1.25).min(5.0);
                 println!("Point size: {:.1}", self.point_size);
                 self.rebuild_vertex_buffer();
             }
-            KeyCode::Minus => {
+            KeyCode::Minus | KeyCode::KpSubtract => {
                 self.point_size = (self.point_size / 1.25).max(1.0);
                 println!("Point size: {:.1}", self.point_size);
                 self.rebuild_vertex_buffer();
-            }
-            KeyCode::F => {
-                self.nav_mode = match self.nav_mode {
-                    NavMode::Orbit => {
-                        println!("[pcdviewr] Nav mode: Fly  (1-finger/drag=look, 2-finger=move, F=back to Orbit)");
-                        NavMode::Fly
-                    }
-                    NavMode::Fly => {
-                        println!("[pcdviewr] Nav mode: Orbit  (drag=orbit, pinch=zoom, F=Fly)");
-                        NavMode::Orbit
-                    }
-                };
             }
             _ => {}
         }
     }
 
     fn key_up_event(&mut self, key: KeyCode, _mods: KeyMods) {
+        // Track movement keys
         match key {
             KeyCode::LeftControl | KeyCode::RightControl => {
                 self.ctrl_held = false;
+            }
+            KeyCode::LeftShift | KeyCode::RightShift => {
+                self.shift_held = false;
             }
             _ => {}
         }
@@ -750,17 +838,30 @@ impl EventHandler for Viewer {
 
 /// Run the viewer with the given point cloud.
 pub fn run(cloud: PointCloud, show_origin: bool) {
-    println!("=== pcdviewr ===");
+    println!("=== pcdviewr (CloudCompare-style navigation) ===");
     println!("Initial point_size: 1.0 (use +/- to adjust)");
     if show_origin {
         println!("Origin axis frame: enabled (X=red, Y=green, Z=blue)");
     }
-    println!("Controls: Q/Escape=quit | Ctrl+Click=select | +/-=point size | Drag=orbit | Scroll=zoom | F=toggle Fly mode");
+    println!("");
+    println!("NAVIGATION (CloudCompare model):");
+    println!("  • Left mouse drag: Rotate around center point (ORBIT)");
+    println!("  • Middle mouse drag: Pan the view");
+    println!("  • Shift + Left drag: Pan the view (alternative)");
+    println!("  • Right mouse drag: Zoom in/out");
+    println!("  • Scroll wheel: Zoom in/out");
+    println!("");
+    println!("OTHER:");
+    println!("  • Ctrl+Click: Select point and display coordinates");
+    println!("  • +/- keys: Adjust point size");
+    println!("  • Esc: Quit");
+    println!("");
+    println!("Info panel on left shows cloud bounds and selected point coords.");
     let viewer = Viewer::new(cloud, show_origin);
 
     miniquad::start(
         conf::Conf {
-            window_title: "pcdviewr v4".to_string(),
+            window_title: "pcdviewr v6 (CloudCompare Nav)".to_string(),
             window_width: 1280,
             window_height: 720,
             ..Default::default()
