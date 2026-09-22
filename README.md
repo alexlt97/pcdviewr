@@ -22,12 +22,12 @@ metadata is not applied.
 
 ```bash
 # Install system dependencies (OpenGL, X11/Wayland via miniquad)
-sudo apt install libgl1-mesa-dev libglu1-mesa-dev
+sudo apt install pkg-config libgl1-mesa-dev libglu1-mesa-dev libwayland-dev
 
 cargo build --release
 ```
 
-Binary: `target/release/app`
+Binary: `target/release/pcdviewr`
 
 ---
 
@@ -43,7 +43,7 @@ Binary: `target/release/app`
 cargo build --release
 ```
 
-Binary: `target\release\app.exe`
+Binary: `target\release\pcdviewr.exe`
 
 #### Option B — Cross-compile from Linux with MinGW
 
@@ -65,7 +65,7 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-Binary: `target/x86_64-pc-windows-gnu/release/app.exe`
+Binary: `target/x86_64-pc-windows-gnu/release/pcdviewr.exe`
 
 > **miniquad on Windows**: uses OpenGL via WGL — no extra DLLs needed on Windows 10+.
 

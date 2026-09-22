@@ -1,0 +1,13 @@
+# Cargo configuration for cross-compilation targets.
+#
+# Windows cross-compilation from Arch Linux:
+#   sudo pacman -S mingw-w64-gcc          # provides x86_64-w64-mingw32-gcc
+#   rustup target add x86_64-pc-windows-gnu
+#
+# From Ubuntu/Debian:
+#   sudo apt install gcc-mingw-w64-x86-64
+#   rustup target add x86_64-pc-windows-gnu
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"

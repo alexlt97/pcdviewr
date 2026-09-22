@@ -1,0 +1,11 @@
+# Cargo build output
+/target/
+
+# Generated distribution packages
+/dist/
+
+# Rust backup files created by rustfmt and editors
+**/*.rs.bk
+
+# Windows debug symbols
+*.pdb
