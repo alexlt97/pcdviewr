@@ -5,10 +5,14 @@ edition = "2021"
 description = "A lightweight, CLI-based point cloud viewer for .pcd files"
 license = "MIT"
 
+[features]
+default = ["native-dialog"]
+native-dialog = ["render/native-dialog"]
+
 [dependencies]
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 reader = {  path = "../reader" }
-render = {  path = "../render" }
+render = {  path = "../render", default-features = false }
 miniquad = "0.4.11"
 egui = "0.31"

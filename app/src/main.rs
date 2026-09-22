@@ -12,8 +12,8 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "pcdviewr", version, about)]
 struct Args {
-    /// Path to the .pcd file to visualize
-    file: PathBuf,
+    /// Optional path to the initial .pcd file
+    file: Option<PathBuf>,
 
     /// Show the coordinate origin as an RGB axis frame (X=red, Y=green, Z=blue)
     #[arg(long)]
@@ -23,11 +23,15 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    println!("Loading {} ...", args.file.display());
-    let cloud = match reader::read_pcd(&args.file) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error: {}", e);
+    let Some(file) = args.file else {
+        render::run_optional(None, args.show_origin);
+        return;
+    };
+    println!("Loading {} ...", file.display());
+    let cloud = match reader::read_pcd(&file) {
+        Ok(cloud) => cloud,
+        Err(error) => {
+            eprintln!("Error: {error}");
             std::process::exit(1);
         }
     };
@@ -37,7 +41,11 @@ fn main() {
         cloud.len(),
         cloud.width(),
         cloud.height(),
-        if cloud.is_organized() { "organized" } else { "unorganized" }
+        if cloud.is_organized() {
+            "organized"
+        } else {
+            "unorganized"
+        }
     );
 
     // Launch viewer (blocks until window closes)

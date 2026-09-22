@@ -27,41 +27,40 @@ impl Camera {
         Self {
             center: Point3::origin(),
             distance: 5.0,
-            yaw: std::f32::consts::FRAC_PI_4,   // 45 degrees
+            yaw: std::f32::consts::FRAC_PI_4,    // 45 degrees
             pitch: -std::f32::consts::FRAC_PI_6, // -30 degrees (looking slightly down)
         }
     }
 
-    /// Create a camera positioned at the origin, looking toward the cloud center.
+    /// Create a camera framing the cloud bounds.
     pub fn from_bounds(min: [f32; 3], max: [f32; 3]) -> Self {
-        let min_v = Vector3::from(min);
-        let max_v = Vector3::from(max);
-        let center = (min_v + max_v) / 2.0;
-        let extent = max_v - min_v;
-        let distance = extent.max() * 2.0;
+        let center = (Vector3::from(min) + Vector3::from(max)) * 0.5;
+        let radius = (Vector3::from(max) - Vector3::from(min)).norm() * 0.5;
+        Self {
+            center: Point3::from(center),
+            distance: (radius / (22.5_f32.to_radians().sin()) * 1.2).max(0.1),
+            ..Self::new()
+        }
+    }
 
-        // Place camera eye at the origin, orbiting around the cloud center.
-        // eye = center + distance * direction, so direction = -center / |center|
-        let center_dist = center.norm();
-        if center_dist < 0.001 {
-            // Cloud center is near origin, fall back to default view
-            Self {
-                center: Point3::from(center),
-                distance,
-                yaw: std::f32::consts::FRAC_PI_4,
-                pitch: -std::f32::consts::FRAC_PI_6,
-            }
-        } else {
-            let dir = -center / center_dist;
-            let yaw = dir.x.atan2(dir.z);
-            let pitch = dir.y.asin();
+    /// Rotate the view while keeping the eye fixed.
+    pub fn look(&mut self, dx: f32, dy: f32) {
+        let eye = self.position();
+        self.orbit(dx, dy);
+        self.center += eye - self.position();
+    }
 
-            Self {
-                center: Point3::from(center),
-                distance: center_dist,
-                yaw,
-                pitch,
-            }
+    fn right(&self) -> Vector3<f32> {
+        Vector3::new(self.yaw.cos(), 0.0, -self.yaw.sin())
+    }
+
+    /// Move in camera-relative directions, in world units.
+    pub fn move_local(&mut self, right: f32, up: f32, forward: f32, amount: f32) {
+        let direction = self.right() * right
+            + Vector3::y() * up
+            + (self.center - self.position()).normalize() * forward;
+        if direction.norm_squared() > 0.0 {
+            self.center += direction.normalize() * amount;
         }
     }
 
@@ -80,16 +79,16 @@ impl Camera {
 
     /// Zoom the camera (scroll wheel).
     pub fn zoom(&mut self, delta: f32) {
-        let factor = 1.0 - delta * 0.1;
+        let factor = (-delta * 0.1).clamp(-2.0, 2.0).exp();
         self.distance *= factor;
-        self.distance = self.distance.max(0.1);
+        self.distance = self.distance.clamp(0.001, 1.0e9);
     }
 
     /// Pan the camera center (keyboard-style, distance-based speed).
     /// `dx` is horizontal pan, `dy` is vertical pan (typically ±1.0).
     pub fn pan(&mut self, dx: f32, dy: f32) {
         let pan_speed = self.distance * 0.01;
-        let right = Vector3::new(-self.yaw.sin(), 0.0, self.yaw.cos());
+        let right = self.right();
         let up = Vector3::y();
         self.center += (right * dx + up * dy) * pan_speed;
     }
@@ -104,7 +103,7 @@ impl Camera {
         // Hard clamp so a single event never changes distance by more than 10%.
         let clamped = damped.clamp(0.90, 1.10);
         self.distance /= clamped;
-        self.distance = self.distance.max(0.1);
+        self.distance = self.distance.clamp(0.001, 1.0e9);
     }
 
     /// Fly the camera forward/backward along its look direction.
@@ -127,7 +126,7 @@ impl Camera {
     pub fn strafe(&mut self, delta: f32) {
         let speed = self.distance * 0.008;
         // Right vector is perpendicular to forward on the XZ plane.
-        let right = Vector3::new(-self.yaw.sin(), 0.0, self.yaw.cos());
+        let right = self.right();
         self.center += right * delta * speed;
     }
 
@@ -135,11 +134,15 @@ impl Camera {
     /// `dx` and `dy` are raw pixel deltas from mouse motion.
     /// Note: screen Y is inverted (down = positive), so we negate dy.
     pub fn pan_mouse(&mut self, dx: f32, dy: f32) {
-        let sensitivity = 0.005 * self.distance;
-        let right = Vector3::new(-self.yaw.sin(), 0.0, self.yaw.cos());
-        let up = Vector3::y();
-        // Negate dy because screen Y goes down but world Y goes up
-        self.center += (right * dx + up * -dy) * sensitivity;
+        self.pan_pixels(dx, dy, 720.0);
+    }
+
+    pub fn pan_pixels(&mut self, dx: f32, dy: f32, height: f32) {
+        let sensitivity = 2.0 * self.distance * 22.5_f32.to_radians().tan() / height.max(1.0);
+        let right = self.right();
+        let forward = (self.center - self.position()).normalize();
+        let up = right.cross(&forward);
+        self.center += (-right * dx + up * dy) * sensitivity;
     }
 
     /// Compute the camera position from spherical coordinates.
@@ -158,5 +161,60 @@ impl Camera {
         let eye = self.position();
         let view = Matrix4::look_at_rh(&eye, &self.center, &Vector3::y());
         view.as_slice().try_into().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strafe_is_perpendicular_to_view_at_several_angles() {
+        for yaw in [0.0, 0.7, 1.5, 3.0] {
+            let mut camera = Camera {
+                yaw,
+                ..Camera::new()
+            };
+            let forward = (camera.center - camera.position()).normalize();
+            let before = camera.center;
+            camera.move_local(1.0, 0.0, 0.0, 2.0);
+            let movement = camera.center - before;
+            assert!(movement.dot(&forward).abs() < 1e-5);
+            assert!((movement.norm() - 2.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn fly_look_keeps_eye_fixed() {
+        let mut camera = Camera::new();
+        let eye = camera.position();
+        camera.look(100.0, 50.0);
+        assert!((camera.position() - eye).norm() < 1e-5);
+    }
+
+    #[test]
+    fn degenerate_bounds_and_large_zoom_stay_finite() {
+        let mut camera = Camera::from_bounds([0.0; 3], [0.0; 3]);
+        assert!(camera.view_matrix().iter().all(|v| v.is_finite()));
+        camera.zoom(1000.0);
+        assert!(camera.distance > 0.0);
+        camera.zoom(-1000.0);
+        assert!(camera.distance.is_finite());
+    }
+
+    #[test]
+    fn dragging_right_moves_scene_right() {
+        let mut camera = Camera::new();
+        let before = camera.center;
+        camera.pan_pixels(100.0, 0.0, 720.0);
+        assert!((camera.center - before).dot(&camera.right()) < 0.0);
+    }
+
+    #[test]
+    fn diagonal_motion_has_same_speed() {
+        let mut camera = Camera::new();
+        let before = camera.center;
+        camera.move_local(1.0, 1.0, 1.0, 3.0);
+        assert!(((camera.center - before).norm() - 3.0).abs() < 1e-5);
     }
 }

@@ -4,14 +4,17 @@ A lightweight GPU-accelerated point cloud viewer for `.pcd` files (ASCII and bin
 
 ## Features
 
-- Orbit camera (mouse drag or 1-finger touch)
-- Zoom (scroll wheel or 2-finger pinch)
-- Pan (2-finger drag on touch screens)
-- Ctrl+click to select and print a point's coordinates
-- `+`/`-` to adjust point size
-- Optional origin axis frame (`--origin` flag)
+- Continuous WASD movement, Q/E down/up, Shift for faster movement
+- Mouse orbit, pan, zoom, and Fly mode for looking around from a fixed position
+- Open without a file and add multiple `.pcd` files with the GUI file browser
+- Distinct colors for each point cloud, with matching scene-list swatches
+- Per-cloud visibility and origin-frame toggles (X red, Y green, Z blue)
+- Ctrl+click to select a point and show coordinates
+- Adjustable movement speed and point size
 
----
+Clouds use their stored XYZ coordinates without automatic alignment or transforms.
+Their coordinate-origin frames therefore overlap at (0, 0, 0). PCD `VIEWPOINT`
+metadata is not applied.
 
 ## Building
 
@@ -24,7 +27,7 @@ sudo apt install libgl1-mesa-dev libglu1-mesa-dev
 cargo build --release
 ```
 
-Binary: `target/release/pcdviewr`
+Binary: `target/release/app`
 
 ---
 
@@ -40,7 +43,7 @@ Binary: `target/release/pcdviewr`
 cargo build --release
 ```
 
-Binary: `target\release\pcdviewr.exe`
+Binary: `target\release\app.exe`
 
 #### Option B — Cross-compile from Linux with MinGW
 
@@ -62,7 +65,7 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-Binary: `target/x86_64-pc-windows-gnu/release/pcdviewr.exe`
+Binary: `target/x86_64-pc-windows-gnu/release/app.exe`
 
 > **miniquad on Windows**: uses OpenGL via WGL — no extra DLLs needed on Windows 10+.
 
@@ -71,41 +74,40 @@ Binary: `target/x86_64-pc-windows-gnu/release/pcdviewr.exe`
 ## Running
 
 ```bash
-pcdviewr path/to/cloud.pcd
+# Start empty, then click "Add point cloud…"
+cargo run -p app
 
-# With origin axis frame
-pcdviewr --origin path/to/cloud.pcd
+# Use another cloud instead of the bundled default
+cargo run -p app -- --show-origin path/to/cloud.pcd
 ```
 
----
+Without a path argument, pcdviewr starts with an empty scene. Pass a path to load
+an initial cloud, or add clouds from the GUI after launch. The native dialog
+filters for `.pcd` files. Adding clouds preserves the camera position. Use
+**Fit scene** or **Home** to frame all clouds. The native picker is enabled by
+default (`native-dialog` Cargo feature). Build with `--no-default-features` to
+use the in-app file browser instead.
 
 ## Controls
 
-### Orbit mode (default)
+| Action | Control |
+|--------|---------|
+| Forward/backward | W / S |
+| Strafe left/right | A / D |
+| Down/up (world Y) | Q / E |
+| Move faster | Hold Shift |
+| Orbit / look in Fly mode | Left drag |
+| Pan | Middle drag or Shift+left drag |
+| Zoom | Wheel or right drag |
+| Switch Orbit/Fly | F or GUI buttons |
+| Fit scene | Home |
+| Select point | Ctrl+click |
+| Point size | + / - or GUI slider |
+| Quit | Escape |
 
-| Action | Mouse | Touch / Tablet |
-|--------|-------|----------------|
-| Orbit | Drag | 1-finger drag |
-| Zoom | Scroll wheel | 2-finger pinch |
-| Pan | — | 2-finger drag |
-| Select point | Ctrl+click | — |
-| Increase point size | `+` | — |
-| Decrease point size | `-` | — |
-| Switch to Fly mode | `F` | 3-finger tap |
-| Quit | Q / Escape | — |
-
-### Fly mode (`F` or 3-finger tap to enter)
-
-Moves the camera *through* the cloud instead of orbiting around it.
-
-| Action | Mouse/KB | Touch / Tablet |
-|--------|----------|----------------|
-| Look around | Drag | 1-finger drag |
-| Fly forward/back | — | 2-finger drag up/down |
-| Strafe left/right | — | 2-finger drag left/right |
-| Switch back to Orbit | `F` | 3-finger tap |
-
----
+Movement speed is adjustable in the scene panel. Keyboard movement works in
+both modes. Touch supports one-finger orbit/look, two-finger pan/pinch in Orbit
+mode or movement in Fly mode, and three-finger mode switching.
 
 ## CI
 
