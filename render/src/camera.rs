@@ -130,13 +130,8 @@ impl Camera {
         self.center += right * delta * speed;
     }
 
-    /// Pan the camera center (mouse-style, fixed sensitivity).
-    /// `dx` and `dy` are raw pixel deltas from mouse motion.
-    /// Note: screen Y is inverted (down = positive), so we negate dy.
-    pub fn pan_mouse(&mut self, dx: f32, dy: f32) {
-        self.pan_pixels(dx, dy, 720.0);
-    }
-
+    /// Pan the camera center so the scene follows a pixel drag.
+    /// `height` is the window height in pixels, used to convert pixels to world units.
     pub fn pan_pixels(&mut self, dx: f32, dy: f32, height: f32) {
         let sensitivity = 2.0 * self.distance * 22.5_f32.to_radians().tan() / height.max(1.0);
         let right = self.right();

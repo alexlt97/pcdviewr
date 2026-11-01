@@ -49,5 +49,5 @@ fn main() {
     );
 
     // Launch viewer (blocks until window closes)
-    render::run(cloud, args.show_origin);
+    render::run_file(file, cloud, args.show_origin);
 }

@@ -53,6 +53,10 @@ const SELECTED_COLOR: [f32; 3] = [1.0, 0.15, 0.15];
 /// Highlight point size (larger than default).
 const SELECTED_POINT_SIZE: f32 = 10000.0;
 
+/// Point size range shared by the +/- keys and the GUI slider.
+const MIN_POINT_SIZE: f32 = 1.0;
+const MAX_POINT_SIZE: f32 = 10.0;
+
 /// Vertex shader source (GLSL 100).
 const VERTEX_SHADER: &str = include_str!("shaders/point.glsl.vert");
 
@@ -85,6 +89,8 @@ void main() {
 
 struct SceneCloud {
     name: String,
+    /// Source file, shown to tell apart clouds that share a file name.
+    path: Option<PathBuf>,
     color: [f32; 3],
     start: usize,
     count: usize,
@@ -135,6 +141,8 @@ pub struct Viewer {
     mouse_button_down: Option<miniquad::MouseButton>,
     /// Whether shift key is held
     shift_held: bool,
+    /// Touch id currently driving the egui pointer (a touch that began over the GUI).
+    ui_touch: Option<u64>,
     /// egui context + renderer (created lazily after the window is live).
     egui_mq: Option<EguiMq>,
 }
@@ -162,6 +170,7 @@ impl Viewer {
             } else {
                 vec![SceneCloud {
                     name: "Initial cloud".into(),
+                    path: None,
                     color: cloud_color(0),
                     start: 0,
                     count: cloud.len(),
@@ -200,14 +209,35 @@ impl Viewer {
             nav_mode: NavMode::Orbit,
             mouse_button_down: None,
             shift_held: false,
+            ui_touch: None,
             egui_mq: None,
         }
+    }
+
+    /// Label the initial cloud with the file it was loaded from.
+    pub fn with_source(mut self, path: PathBuf) -> Self {
+        if let Some(cloud) = self.clouds.first_mut() {
+            cloud.name = file_name(&path);
+            cloud.path = Some(path);
+        }
+        self
     }
 
     fn pointer_captured(&self) -> bool {
         self.browser_open
             || self.egui_mq.as_ref().is_some_and(|e| {
                 e.egui_ctx().is_pointer_over_area() || e.egui_ctx().wants_pointer_input()
+            })
+    }
+
+    /// Whether a screen position (in physical pixels) lies on the GUI. Unlike
+    /// `pointer_captured`, this does not rely on hover state, which touches never set.
+    fn ui_at(&self, x: f32, y: f32) -> bool {
+        self.browser_open
+            || self.egui_mq.as_ref().is_some_and(|e| {
+                let ctx = e.egui_ctx();
+                let ppp = ctx.pixels_per_point();
+                ctx.layer_id_at(egui::pos2(x / ppp, y / ppp)).is_some()
             })
     }
 
@@ -252,33 +282,15 @@ impl Viewer {
                 self.point_count = all.len() as u32;
                 self.cloud = PointCloud::new(all, self.point_count, 1, false);
                 self.clouds.push(SceneCloud {
-                    name: path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
+                    name: file_name(&path),
+                    path: Some(path),
                     color: cloud_color(self.clouds.len()),
                     start,
                     count,
                     visible: true,
                     origin: self.show_origin,
                 });
-                let bounds = cloud_bounds(&self.cloud);
-                self.scene_extent = Vector3::from(bounds.0)
-                    .norm()
-                    .max(Vector3::from(bounds.1).norm())
-                    .max(1.0);
-                self.rebuild_vertex_buffer();
-                let ctx = self.ctx.as_mut().unwrap();
-                if let Some(buffer) = self.index_buffer.take() {
-                    ctx.delete_buffer(buffer);
-                }
-                let indices: Vec<u32> = (0..self.point_count).collect();
-                self.index_buffer = Some(ctx.new_buffer(
-                    BufferType::IndexBuffer,
-                    BufferUsage::Immutable,
-                    BufferSource::slice(&indices),
-                ));
+                self.rebuild_scene_buffers();
                 if first {
                     self.fit_scene();
                 }
@@ -289,12 +301,58 @@ impl Viewer {
         }
     }
 
+    /// Remove a cloud from the scene and close the gap it leaves in the combined buffer.
+    fn remove_cloud(&mut self, index: usize) {
+        let removed = self.clouds.remove(index);
+        let range = removed.start..removed.start + removed.count;
+        let mut points = self.cloud.points().to_vec();
+        points.drain(range.clone());
+        // Clouds are stored back to back, so every later cloud shifts down.
+        for cloud in &mut self.clouds[index..] {
+            cloud.start -= removed.count;
+        }
+        match self.selected_point {
+            Some(idx) if range.contains(&idx) => {
+                self.selected_point = None;
+                self.selected_point_info = None;
+            }
+            Some(idx) if idx >= range.end => {
+                self.selected_point = Some(idx - removed.count);
+                if let Some(info) = self.selected_point_info.as_mut() {
+                    info.0 -= removed.count;
+                }
+            }
+            _ => {}
+        }
+        self.point_count = points.len() as u32;
+        self.cloud = PointCloud::new(points, self.point_count, 1, false);
+        self.rebuild_scene_buffers();
+    }
+
+    /// Recompute scene extent and re-upload the point, index and axis buffers.
+    fn rebuild_scene_buffers(&mut self) {
+        let bounds = cloud_bounds(&self.cloud);
+        self.scene_extent = Vector3::from(bounds.0)
+            .norm()
+            .max(Vector3::from(bounds.1).norm())
+            .max(1.0);
+        self.rebuild_vertex_buffer();
+        self.rebuild_axis_buffer();
+        let ctx = self.ctx.as_mut().unwrap();
+        if let Some(buffer) = self.index_buffer.take() {
+            ctx.delete_buffer(buffer);
+        }
+        let indices: Vec<u32> = (0..self.point_count.max(1)).collect();
+        self.index_buffer = Some(ctx.new_buffer(
+            BufferType::IndexBuffer,
+            BufferUsage::Immutable,
+            BufferSource::slice(&indices),
+        ));
+    }
+
     /// Initialize GPU resources (called once on first frame, inside miniquad loop).
     fn init(&mut self) {
         self.point_count = self.cloud.len() as u32;
-
-        // Compute bounds for axis scaling
-        let (bounds_min, bounds_max) = cloud_bounds(&self.cloud);
 
         // Create a single rendering backend shared by both our 3D rendering
         // and egui. Two separate backends pointing at the same GL context
@@ -373,32 +431,8 @@ impl Viewer {
             },
         ));
 
-        // Build axis frame if enabled
+        // Build axis frame (vertices are built in rebuild_axis_buffer)
         {
-            // Axis length scales with cloud bounds
-            let scale = (bounds_max[0] - bounds_min[0])
-                .max(bounds_max[1] - bounds_min[1])
-                .max(bounds_max[2] - bounds_min[2])
-                .max(1.0)
-                * 0.1;
-
-            // 6 vertices: X axis (red), Y axis (green), Z axis (blue)
-            // Each vertex: x, y, z, r, g, b
-            let axis_verts: [f32; 36] = [
-                // X axis (red)
-                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, scale, 0.0, 0.0, 1.0, 0.0, 0.0,
-                // Y axis (green)
-                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, scale, 0.0, 0.0, 1.0, 0.0,
-                // Z axis (blue)
-                0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, scale, 0.0, 0.0, 1.0,
-            ];
-
-            self.axis_vertex_buffer = Some(ctx.new_buffer(
-                BufferType::VertexBuffer,
-                BufferUsage::Immutable,
-                BufferSource::slice(&axis_verts),
-            ));
-
             // Index buffer for 3 line segments (6 vertices)
             let axis_indices: [u32; 6] = [0, 1, 2, 3, 4, 5];
             self.axis_index_buffer = Some(ctx.new_buffer(
@@ -445,8 +479,42 @@ impl Viewer {
                 },
             ));
         }
+        self.rebuild_axis_buffer();
 
         self.initialized = true;
+    }
+
+    /// Rebuild the axis frame vertices so their length matches the current scene bounds.
+    fn rebuild_axis_buffer(&mut self) {
+        let (bounds_min, bounds_max) = cloud_bounds(&self.cloud);
+        // Axis length scales with cloud bounds
+        let scale = (bounds_max[0] - bounds_min[0])
+            .max(bounds_max[1] - bounds_min[1])
+            .max(bounds_max[2] - bounds_min[2])
+            .max(1.0)
+            * 0.1;
+
+        // 6 vertices: X axis (red), Y axis (green), Z axis (blue)
+        // Each vertex: x, y, z, r, g, b
+        #[rustfmt::skip]
+        let axis_verts: [f32; 36] = [
+            // X axis (red)
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, scale, 0.0, 0.0, 1.0, 0.0, 0.0,
+            // Y axis (green)
+            0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, scale, 0.0, 0.0, 1.0, 0.0,
+            // Z axis (blue)
+            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, scale, 0.0, 0.0, 1.0,
+        ];
+
+        let ctx = self.ctx.as_mut().expect("Context not initialized");
+        if let Some(buffer) = self.axis_vertex_buffer.take() {
+            ctx.delete_buffer(buffer);
+        }
+        self.axis_vertex_buffer = Some(ctx.new_buffer(
+            BufferType::VertexBuffer,
+            BufferUsage::Immutable,
+            BufferSource::slice(&axis_verts),
+        ));
     }
 
     /// Apply uniforms (view-projection matrix + color).
@@ -690,6 +758,7 @@ impl EventHandler for Viewer {
             let mut new_point_size = point_size;
 
             let mut add_path = None;
+            let mut remove_index = None;
             let mut fit = false;
             #[cfg(feature = "native-dialog")]
             let mut native_dialog_requested = false;
@@ -707,9 +776,14 @@ impl EventHandler for Viewer {
                                 self.browser_open = true;
                             }
                         }
+                        if let Some(error) = &self.load_error {
+                            ui.colored_label(egui::Color32::LIGHT_RED, error);
+                        }
                         if self.clouds.is_empty() {
                             ui.label("Add a .pcd file to get started.");
                         }
+                        let names: Vec<String> =
+                            self.clouds.iter().map(|c| c.name.clone()).collect();
                         egui::ScrollArea::vertical()
                             .max_height(200.0)
                             .show(ui, |ui| {
@@ -718,11 +792,36 @@ impl EventHandler for Viewer {
                                         ui.horizontal(|ui| {
                                             ui.checkbox(&mut cloud.visible, "");
                                             let [r, g, b] = cloud.color.map(|c| (c * 255.0) as u8);
-                                            ui.colored_label(
+                                            let label = ui.colored_label(
                                                 egui::Color32::from_rgb(r, g, b),
                                                 &cloud.name,
                                             );
+                                            if let Some(path) = &cloud.path {
+                                                label.on_hover_text(path.display().to_string());
+                                            }
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .small_button("🗙")
+                                                        .on_hover_text("Remove from scene")
+                                                        .clicked()
+                                                    {
+                                                        remove_index = Some(i);
+                                                    }
+                                                },
+                                            );
                                         });
+                                        // Show the path when another cloud has the same file name.
+                                        if let Some(path) = cloud.path.as_ref().filter(|_| {
+                                            names.iter().filter(|n| **n == cloud.name).count() > 1
+                                        }) {
+                                            ui.label(
+                                                egui::RichText::new(path.display().to_string())
+                                                    .small()
+                                                    .weak(),
+                                            );
+                                        }
                                         ui.horizontal(|ui| {
                                             ui.label(format!("{} points", cloud.count));
                                             ui.checkbox(&mut cloud.origin, "Origin frame");
@@ -745,7 +844,8 @@ impl EventHandler for Viewer {
                                 .text("Move speed"),
                         );
                         ui.add(
-                            egui::Slider::new(&mut new_point_size, 1.0..=10.0).text("Point size"),
+                            egui::Slider::new(&mut new_point_size, MIN_POINT_SIZE..=MAX_POINT_SIZE)
+                                .text("Point size"),
                         );
                         ui.label("W/S forward/back · A/D left/right");
                         ui.label("Q/E down/up · Shift faster · F mode");
@@ -824,14 +924,14 @@ impl EventHandler for Viewer {
                                     }
                                 }
                             }
-                            if let Some(error) = &self.load_error {
-                                ui.colored_label(egui::Color32::LIGHT_RED, error);
-                            }
                         });
                 }
             });
             if let Some(path) = add_path {
                 self.load_cloud(path);
+            }
+            if let Some(index) = remove_index {
+                self.remove_cloud(index);
             }
             if fit {
                 self.fit_scene();
@@ -996,12 +1096,12 @@ impl EventHandler for Viewer {
                 self.ctrl_held = true;
             }
             KeyCode::Equal | KeyCode::KpAdd => {
-                self.point_size = (self.point_size * 1.25).min(5.0);
+                self.point_size = (self.point_size * 1.25).min(MAX_POINT_SIZE);
                 println!("Point size: {:.1}", self.point_size);
                 self.rebuild_vertex_buffer();
             }
             KeyCode::Minus | KeyCode::KpSubtract => {
-                self.point_size = (self.point_size / 1.25).max(1.0);
+                self.point_size = (self.point_size / 1.25).max(MIN_POINT_SIZE);
                 println!("Point size: {:.1}", self.point_size);
                 self.rebuild_vertex_buffer();
             }
@@ -1054,9 +1154,39 @@ impl EventHandler for Viewer {
     ///   - 2 finger drag left  → strafe left
     ///   - 2 finger drag right → strafe right
     ///   - 3 finger tap        → switch back to Orbit mode
+    ///
+    /// Overriding this disables miniquad's touch-to-mouse emulation, so a touch
+    /// that starts on the GUI is forwarded to egui as a left-button pointer instead.
     fn touch_event(&mut self, phase: TouchPhase, id: u64, x: f32, y: f32) {
-        if self.pointer_captured() {
-            self.touch_points.clear();
+        if phase == TouchPhase::Started
+            && self.touch_points.is_empty()
+            && self.ui_touch.is_none()
+            && self.ui_at(x, y)
+        {
+            self.ui_touch = Some(id);
+            if let Some(e) = self.egui_mq.as_mut() {
+                e.mouse_motion_event(x, y);
+                e.mouse_button_down_event(miniquad::MouseButton::Left, x, y);
+            }
+            return;
+        }
+        if self.ui_touch == Some(id) {
+            if let Some(e) = self.egui_mq.as_mut() {
+                match phase {
+                    TouchPhase::Moved => e.mouse_motion_event(x, y),
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        e.mouse_button_up_event(miniquad::MouseButton::Left, x, y)
+                    }
+                    TouchPhase::Started => {}
+                }
+            }
+            if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                self.ui_touch = None;
+            }
+            return;
+        }
+        // Ignore extra fingers while the GUI owns the pointer.
+        if self.ui_touch.is_some() {
             return;
         }
         match phase {
@@ -1110,7 +1240,7 @@ impl EventHandler for Viewer {
                             let dmx = (ax + bx) / 2.0 - (old_ax + old_bx) / 2.0;
                             let dmy = (ay + by) / 2.0 - (old_ay + old_by) / 2.0;
                             if dmx.abs() > 0.5 || dmy.abs() > 0.5 {
-                                self.camera.pan_mouse(dmx, dmy);
+                                self.camera.pan_pixels(dmx, dmy, window::screen_size().1);
                             }
                         }
                     }
@@ -1133,9 +1263,10 @@ impl EventHandler for Viewer {
                             let dmx = (ax + bx) / 2.0 - (old_ax + old_bx) / 2.0;
                             let dmy = (ay + by) / 2.0 - (old_ay + old_by) / 2.0;
 
-                            // Vertical midpoint delta → fly forward/back (screen Y down = forward)
+                            // Vertical midpoint delta → fly forward/back (drag up = forward;
+                            // screen Y grows downward, so negate)
                             if dmy.abs() >= dmx.abs() {
-                                self.camera.fly_forward(dmy);
+                                self.camera.fly_forward(-dmy);
                             } else {
                                 // Horizontal midpoint delta → strafe
                                 self.camera.strafe(dmx);
@@ -1156,12 +1287,19 @@ pub fn run(cloud: PointCloud, show_origin: bool) {
     run_optional(Some(cloud), show_origin);
 }
 
+/// Run the viewer with a point cloud loaded from `path`, labelled with its file name.
+pub fn run_file(path: PathBuf, cloud: PointCloud, show_origin: bool) {
+    start(Viewer::new(cloud, show_origin).with_source(path));
+}
+
 pub fn run_optional(cloud: Option<PointCloud>, show_origin: bool) {
-    let viewer = Viewer::new(
+    start(Viewer::new(
         cloud.unwrap_or_else(|| PointCloud::new(vec![], 0, 1, false)),
         show_origin,
-    );
+    ));
+}
 
+fn start(viewer: Viewer) {
     miniquad::start(
         conf::Conf {
             window_title: "pcdviewr".to_string(),
@@ -1171,6 +1309,13 @@ pub fn run_optional(cloud: Option<PointCloud>, show_origin: bool) {
         },
         move || Box::new(viewer),
     );
+}
+
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Compute min/max bounding box of a point cloud.
